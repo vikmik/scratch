@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+
+die() {
+    echo "$1" >&2
+    exit 1
+}
+
+die_usage() {
+    die "Usage: scratch <name>"
+}
+
+check_requirement() {
+    local command="$1"
+    type -P "$command" >/dev/null || die "This script requires the command '$command'"
+}
+
+check_requirement unshare
+check_requirement sha256sum
+check_requirement flock
+check_requirement id
+check_requirement findmnt
+check_requirement mount
+check_requirement bash
+check_requirement awk
+
+
+[[ $# == 1 ]] || die_usage
+SCRATCH_NAME="$1"
+[[ -z "${SCRATCH_NAME}" ]] && die_usage
+[[ $(id -u) == 0 ]] || die "Must be root"
+
+# By default, all writes will go to the following dir. Feel free to change the location.
+SCRATCH_ROOT="/tmp/scratch-envs"
+mkdir -p $SCRATCH_ROOT
+
+LOGIN_AS=${SUDO_USER-root}
+CWD=$(/bin/pwd -P)
+SCRATCH_MARKER="/etc/scratch-environment"
+SCRATCH_ENV_ROOT="${SCRATCH_ROOT}/${SCRATCH_NAME}"
+
+[[ -f ${SCRATCH_MARKER} ]] && die "Cannot enter a scratch environment from another one"
+
+mkdir -p ${SCRATCH_ENV_ROOT}
+cd ${SCRATCH_ENV_ROOT}
+
+# Can't open 2 sessions to the same env. Otherwise it opens the doot to very confusing and unexpected behaviors.
+(
+flock -nx 42 || die "Scratch environment ${SCRATCH_NAME} already in use"
+
+# Don't mess with the current mount namespace. Do all our hacks inside an expendable mount namespace,
+# so all mounts will be automatically cleaned up when the user exits the shell session.
+unshare -m bash << EOF
+    # Horrible heredoc. Most '$' need to be escaped. Terribad!
+    mkdir -p top/etc merge work
+
+    # Write marker so it can be read by the shell
+    echo ${SCRATCH_NAME} > top${SCRATCH_MARKER}
+
+    # Overlay rootfs
+    echo "Adding overlay for /"
+    mount -t overlay overlay -o lowerdir=/,upperdir=top,workdir=work merge
+    
+    # Overlay all other mountpoints
+    while read line; do
+        eval "\$line"
+        [[ \$TARGET == "/" ]] && continue
+        [[ \$FSTYPE == "nsfs" ]] && { echo "Ignoring \$TARGET of type nsfs"; continue; }
+        [[ \$FSTYPE == "vfat" ]] && { echo "Ignoring \$TARGET of type vfat"; continue; }
+        [[ \$FSTYPE == "overlay" ]] && { echo "Ignoring \$TARGET of type overlay"; continue; }
+        [[ \$TARGET == ${SCRATCH_ROOT}* ]] && { echo "Skipping \$TARGET inside scratch fs root"; continue; }
+        if [[ \$TARGET =~ ^/sys ]] || [[ \$TARGET =~ ^/proc ]] || [[ \$TARGET =~ ^/dev ]] || [[ \$TARGET =~ ^/run ]]; then
+            echo "Not overlaying \$TARGET, will bind mount"
+            continue
+        fi
+        # Flatten overlay space.
+        # Generate predictable IDs so the scratch environment can be exited and re-entered later without loss of state.
+        id=\$(echo "\$TARGET" | sha256sum | awk '{print \$1}' | head -c 32)
+        mkdir -p top-\${id} work-\${id}
+        echo "Adding overlay for \${TARGET}"
+        mount -t overlay overlay -o lowerdir=\${TARGET},upperdir=top-\${id},workdir=work-\${id} merge\${TARGET}
+    done < <(findmnt -P)
+    
+    echo "Bind-mounting /sys"
+    mount --rbind /sys merge/sys
+    echo "Bind-mounting /dev"
+    mount --rbind /dev merge/dev
+    echo "Bind-mounting /proc"
+    mount --rbind /proc merge/proc
+    echo "Bind-mounting /run"
+    mount --rbind /run merge/run
+    
+    CWD="${CWD}" # More heredoc madness
+    if ! [[ -d merge\${CWD} ]]; then
+        # Fallback to home directory if the current directory does not exist in the overlay.
+        CWD=$(echo ~${LOGIN_AS})
+    fi
+   
+    echo
+    echo "Entering scratch environment ${SCRATCH_NAME}"
+    echo "-----------------------------"
+    unshare -m -R merge -w merge\${CWD} /usr/bin/env bash -c "sudo -u ${LOGIN_AS} bash < /dev/tty"
+    
+    echo "-----------------------------"
+    echo "Leaving scratch environment ${SCRATCH_NAME}"
+EOF
+) 42>/var/lock/scratch-${SCRATCH_NAME}.lock
+
